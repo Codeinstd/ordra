@@ -1,6 +1,0 @@
-{
-  "version": 3,
-  "sources": [],
-  "sections": [
-    {"offset": {"line": 16, "column": 0}, "map": {"version":3,"sources":["file:///Users/dave/Desktop/procurement-approval-engine/frontend/middleware.ts"],"sourcesContent":["import { withAuth } from \"next-auth/middleware\";\n\n// Explicitly calling withAuth() here (rather than re-exporting next-auth's\n// default) so this file's default export is unambiguously a function —\n// Next's middleware static check doesn't reliably resolve a bare\n// `export { default } from \"next-auth/middleware\"` re-export.\nexport default withAuth({\n  pages: { signIn: \"/signin\" },\n});\n\nexport const config = {\n  matcher: [\"/approvals/:path*\", \"/vendors/:path*\", \"/rfqs/:path*\", \"/requests/:path*\"],\n};\n"],"names":["pages","signIn","config","matcher"],"mappings":";;;;;;AAAA;;uCAMe,IAAA,0KAAQ,EAAC;IACtBA,OAAO;QAAEC,QAAQ;IAAU;AAC7B;AAEO,MAAMC,SAAS;IACpBC,SAAS;QAAC;QAAqB;QAAmB;QAAgB;KAAmB;AACvF"}}]
-}

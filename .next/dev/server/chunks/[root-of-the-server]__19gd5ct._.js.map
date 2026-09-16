@@ -1,6 +1,0 @@
-{
-  "version": 3,
-  "sources": [],
-  "sections": [
-    {"offset": {"line": 142, "column": 0}, "map": {"version":3,"sources":["file:///Users/dave/Desktop/procurement-approval-engine/frontend/proxy.ts"],"sourcesContent":["import { withAuth } from \"next-auth/middleware\";\n\nexport default withAuth({\n  pages: {\n    signIn: \"/signin\",\n  },\n});\n\nexport const config = {\n  matcher: [\n    \"/approvals/:path*\",\n    \"/vendors/:path*\",\n    \"/rfqs/:path*\",\n    \"/requests/:path*\",\n  ],\n};"],"names":["pages","signIn","config","matcher"],"mappings":";;;;;;AAAA;;uCAEe,IAAA,sJAAQ,EAAC;IACtBA,OAAO;QACLC,QAAQ;IACV;AACF;AAEO,MAAMC,SAAS;IACpBC,SAAS;QACP;QACA;QACA;QACA;KACD;AACH"}}]
-}
