@@ -1,6 +1,7 @@
 import { PurchaseRequest, ApprovalStep, Vendor, ComparisonMatrix, RfqEvent } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000/api" ;
+console.log("API_BASE:", API_BASE);
 
 // Public — no token yet, this is what gets you one via the credentials
 // sign-in that follows immediately after.
@@ -118,20 +119,26 @@ export async function exportPurchaseOrder(token: string, purchaseRequestId: stri
   return res.json();
 }
 
-// The one-shot "create + submit" path — see backend/src/quick-request.ts
-// for why this exists instead of the full multi-step RFQ flow.
 export async function createQuickRequest(
   token: string,
-  data: { vendorName: string; category: string; department: string; amount: number }
+  data: {
+    category: string;
+    department: string;
+    amount: number;
+  }
 ) {
   const res = await fetch(`${API_BASE}/purchase-requests/quick`, {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(data),
   });
+
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error ?? `Failed to create request: ${res.status}`);
+    throw new Error(
+      body.error ?? `Failed to create request: ${res.status}`
+    );
   }
+
   return res.json();
 }

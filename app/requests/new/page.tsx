@@ -23,7 +23,6 @@ export default function NewRequestPage() {
     setError(null);
     try {
       const pr = await createQuickRequest(session.backendToken, {
-        vendorName,
         category,
         department,
         amount: Number(amount),
@@ -87,11 +86,11 @@ export default function NewRequestPage() {
           <div className="font-body text-sm text-ink">Request created — status: {result.status}</div>
           <div className="mt-2 font-body text-xs text-slate">Routed to:</div>
           <ul className="mt-1 space-y-1">
-            {result.steps.map((s, i) => (
-              <li key={i} className="font-mono text-xs text-slate">
-                {s.approverRole.replace(/_/g, " ")}
-              </li>
-            ))}
+              {(result.steps ?? []).map((s, i) => (
+                <li key={i} className="font-mono text-xs text-slate">
+                  {(s.approverRole ?? "Approver").replace(/_/g, " ")}
+                </li>
+              ))}
           </ul>
           <p className="mt-3 font-body text-xs text-slate">
             Sign in as one of those approvers to see it in their /approvals queue.
