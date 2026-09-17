@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "PurchaseRequest" ALTER COLUMN "rfqId" DROP NOT NULL,
+ALTER COLUMN "quoteId" DROP NOT NULL;

@@ -1,0 +1,220 @@
+// Approval workflow engine schema.
+// Everything is append-only for steps and audit log rows — nothing is deleted,
+// only ever superseded, so the history stays a defensible audit trail.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String?  // null for Google-only accounts
+  googleId     String?  @unique
+  role         String   // e.g. "direct_manager", "legal_reviewer", "cfo" — coarse role tag used by policy templates
+  managerId    String?
+  department   String
+  createdAt    DateTime @default(now())
+
+  requestedPRs      PurchaseRequest[] @relation("requester")
+  approvalSteps     ApprovalStep[]    @relation("approver")
+  delegationsGiven  Delegation[]      @relation("delegator")
+  delegationsTaken  Delegation[]      @relation("delegate")
+}
+
+model Delegation {
+  id          String   @id @default(uuid())
+  delegatorId String
+  delegateId  String
+  startDate   DateTime
+  endDate     DateTime
+  reason      String?
+
+  delegator User @relation("delegator", fields: [delegatorId], references: [id])
+  delegate  User @relation("delegate", fields: [delegateId], references: [id])
+}
+
+model ApprovalPolicy {
+  id             String   @id @default(uuid())
+  name           String
+  priority       Int      @default(0)
+  department     String?  // null = applies to any department
+  category       String?  // null = applies to any category
+  amountMin      Decimal? @db.Decimal(14, 2)
+  amountMax      Decimal? @db.Decimal(14, 2)
+  chainTemplate  Json     // ordered list of { order, type, role|roles, condition? } — see routing-engine.ts
+  activeFrom     DateTime @default(now())
+  activeUntil    DateTime?
+
+  @@index([department, category])
+}
+
+model PurchaseRequest {
+  id                   String   @id @default(uuid())
+  rfqId                String?
+  quoteId              String?
+  requesterId          String
+  amount               Decimal  @db.Decimal(14, 2)
+  department           String
+  category             String
+  status               String   @default("draft")
+  currentRoutingVersion Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  requester User            @relation("requester", fields: [requesterId], references: [id])
+  steps     ApprovalStep[]
+  auditLog  ApprovalAuditLog[]
+}
+
+model ApprovalStep {
+  id                String   @id @default(uuid())
+  purchaseRequestId String
+  routingVersion    Int      // which reconciliation pass produced this row
+  stepOrder         Int
+  stepType          String   // 'sequential' | 'parallel_group'
+  groupId           String?  // shared by all members of one parallel_group
+  approverRole      String
+  approverUserId    String
+  status            String   @default("pending") // pending | approved | rejected | superseded
+  actedById         String?
+  actedAt           DateTime?
+  comments          String?
+  createdAt         DateTime @default(now())
+
+  purchaseRequest PurchaseRequest @relation(fields: [purchaseRequestId], references: [id])
+  approver        User            @relation("approver", fields: [approverUserId], references: [id])
+
+  @@index([purchaseRequestId, routingVersion])
+  @@index([approverUserId, status])
+}
+
+// ---- Vendor discovery -------------------------------------------------
+
+model Vendor {
+  id             String   @id @default(uuid())
+  name           String
+  website        String?
+  categories     String[] // tags like "laptops", "industrial-equipment"
+  certifications String[] // e.g. "ISO9001", "SOC2", "WBENC"
+  contactEmail   String?
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  quotes           Quote[]
+  reliabilityScore ReliabilityScore?
+}
+
+// ---- RFQ / quote requests ----------------------------------------------
+
+model RfqEvent {
+  id          String   @id @default(uuid())
+  title       String
+  category    String
+  requesterId String
+  budget      Decimal? @db.Decimal(14, 2)
+  specNotes   String?
+  status      String   @default("open") // open | comparing | awarded | cancelled
+  createdAt   DateTime @default(now())
+
+  quotes Quote[]
+}
+
+model Quote {
+  id              String   @id @default(uuid())
+  rfqEventId      String
+  vendorId        String
+  rawDocumentUrl  String?
+  rawEmailText    String?
+  status          String   @default("received") // received | extracting | needs_review | ready | stale
+  totalPrice      Decimal? @db.Decimal(14, 2)
+  currency        String   @default("USD")
+  createdAt       DateTime @default(now())
+
+  rfqEvent       RfqEvent        @relation(fields: [rfqEventId], references: [id])
+  vendor         Vendor          @relation(fields: [vendorId], references: [id])
+  extractedSpecs ExtractedSpec[]
+}
+
+model SpecSchema {
+  id       String @id @default(uuid())
+  category String
+  fieldKey String
+  fieldType String  // string | number | boolean | enum
+  unit     String?
+  required Boolean @default(false)
+
+  @@unique([category, fieldKey])
+}
+
+model ExtractedSpec {
+  id          String   @id @default(uuid())
+  quoteId     String
+  fieldKey    String
+  value       String
+  unit        String?
+  confidence  Float    // 0..1
+  sourceSpan  String?  // the exact source text the value was pulled from
+  reviewedById String?
+  reviewedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  quote Quote @relation(fields: [quoteId], references: [id])
+
+  @@index([quoteId])
+}
+
+// ---- Vendor reliability -------------------------------------------------
+
+model ReliabilityScore {
+  id            String   @id @default(uuid())
+  vendorId      String   @unique
+  score         Int      // 0-100
+  rationale     String   // human-readable explanation, generated alongside the score
+  signals       Json     // { onTimeDeliveryRate, financialHealth, certCount, reviewSummary, ... }
+  computedAt    DateTime @default(now())
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+}
+
+// ---- Negotiation ---------------------------------------------------------
+
+model NegotiationThread {
+  id        String   @id @default(uuid())
+  quoteId   String
+  status    String   @default("drafting") // drafting | awaiting_approval | sent | vendor_responded | settled
+  targetSavingsPct Float?
+  createdAt DateTime @default(now())
+
+  messages NegotiationMessage[]
+}
+
+model NegotiationMessage {
+  id          String   @id @default(uuid())
+  threadId    String
+  direction   String   // outbound_draft | outbound_sent | inbound
+  body        String
+  approvedById String?
+  approvedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  thread NegotiationThread @relation(fields: [threadId], references: [id])
+}
+
+model ApprovalAuditLog {
+  id                String   @id @default(uuid())
+  purchaseRequestId String
+  eventType         String   // routed | rerouted | step_approved | step_rejected | finalization_blocked_reroute | approved | rejected
+  actorId           String?
+  metadata          Json
+  createdAt         DateTime @default(now())
+
+  purchaseRequest PurchaseRequest @relation(fields: [purchaseRequestId], references: [id])
+}
