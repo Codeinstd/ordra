@@ -19,6 +19,7 @@ export const authOptions: NextAuthOptions = {
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
+        console.log("[auth] email:", credentials?.email);
         if (!credentials?.email || !credentials?.password) return null;
 
         const res = await fetch(`${BACKEND_API_BASE}/auth/login`, {
@@ -29,6 +30,9 @@ export const authOptions: NextAuthOptions = {
         if (!res.ok) return null; // NextAuth turns a null return into a rejected sign-in
 
         const { token, user } = await res.json();
+
+        console.log("[auth] user found:", !!user);
+console.log("[auth] has password:", !!user?.passwordHash);
         // Everything returned here lands in the `user` param of the jwt
         // callback below on first sign-in.
         return { id: user.id, name: user.name, email: user.email, backendToken: token };
