@@ -1,6 +1,6 @@
 # AI procurement tool — reference implementation
 
-Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis) + Claude (Anthropic SDK).
+Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis).
 Frontend: Next.js (App Router) + React + TypeScript + Tailwind.
 
 ## What's real vs. what still needs your own credentials
