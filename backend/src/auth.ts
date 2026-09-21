@@ -18,6 +18,7 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   return bcrypt.compare(password, hash);
 }
 
+
 export function issueToken(user: { id: string; email: string; name: string; organizationId: string }): string {
   const payload: AuthTokenPayload = { sub: user.id, email: user.email, name: user.name, organizationId: user.organizationId };
   return jwt.sign(payload, JWT_SECRET!, { expiresIn: "7d" });
