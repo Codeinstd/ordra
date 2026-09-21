@@ -1,0 +1,298 @@
+// Approval workflow engine schema.
+// Everything is append-only for steps and audit log rows — nothing is deleted,
+// only ever superseded, so the history stays a defensible audit trail.
+//
+// Multi-tenant: every top-level entity that gets listed or queried directly
+// (User, Vendor, RfqEvent, ApprovalPolicy, PurchaseRequest) carries an
+// organizationId. Child records (Quote, ApprovalStep, ExtractedSpec, ...)
+// are scoped implicitly through their parent — they don't need their own
+// organizationId as long as every query reaches them via an org-scoped
+// parent, which the route layer is responsible for enforcing.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  users            User[]
+  vendors          Vendor[]
+  rfqEvents        RfqEvent[]
+  approvalPolicies ApprovalPolicy[]
+  purchaseRequests PurchaseRequest[]
+  invites          OrgInvite[]
+}
+
+// Lets a real team end up in the same org instead of every self-serve
+// signup creating its own isolated one-person org. Registration checks
+// for a pending invite matching the signing-up email before defaulting to
+// "create a new organization".
+model OrgInvite {
+  id             String    @id @default(uuid())
+  organizationId String
+  email          String
+  invitedById    String
+  createdAt      DateTime  @default(now())
+  acceptedAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, email])
+}
+
+model User {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  email          String   @unique
+  emailVerified  Boolean  @default(false)
+  passwordHash   String?  // null for Google-only accounts
+  googleId       String?  @unique
+  role           String   // e.g. "direct_manager", "legal_reviewer", "cfo" — coarse role tag used by policy templates
+  isOrgOwner     Boolean  @default(false) // first user of a new org; can invite teammates
+  managerId      String?
+  department     String
+  createdAt      DateTime @default(now())
+
+  organization      Organization      @relation(fields: [organizationId], references: [id])
+  requestedPRs      PurchaseRequest[] @relation("requester")
+  approvalSteps     ApprovalStep[]    @relation("approver")
+  delegationsGiven  Delegation[]      @relation("delegator")
+  delegationsTaken  Delegation[]      @relation("delegate")
+
+  @@index([organizationId])
+}
+
+model Delegation {
+  id          String   @id @default(uuid())
+  delegatorId String
+  delegateId  String
+  startDate   DateTime
+  endDate     DateTime
+  reason      String?
+
+  delegator User @relation("delegator", fields: [delegatorId], references: [id])
+  delegate  User @relation("delegate", fields: [delegateId], references: [id])
+}
+
+// Shared by password reset and email verification — same shape (a
+// single-use, expiring, hashed token tied to a user), different purpose.
+// The token itself is never stored in plaintext, only its hash, so a
+// database read alone can't be used to reset someone's password.
+model VerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  purpose   String    // "password_reset" | "email_verification"
+  tokenHash String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, purpose])
+}
+
+model ApprovalPolicy {
+  id             String    @id @default(uuid())
+  organizationId String
+  name           String
+  priority       Int       @default(0)
+  department     String?   // null = applies to any department
+  category       String?   // null = applies to any category
+  amountMin      Decimal?  @db.Decimal(14, 2)
+  amountMax      Decimal?  @db.Decimal(14, 2)
+  chainTemplate  Json      // ordered list of { order, type, role|roles, condition? } — see routing-engine.ts
+  activeFrom     DateTime  @default(now())
+  activeUntil    DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, department, category])
+}
+
+model PurchaseRequest {
+  id                    String   @id @default(uuid())
+  organizationId        String
+  rfqId                 String
+  quoteId               String
+  requesterId           String
+  amount                Decimal  @db.Decimal(14, 2)
+  department            String
+  category              String
+  status                String   @default("draft") // draft | routing | in_review | approved | rejected
+  currentRoutingVersion Int      @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  requester    User               @relation("requester", fields: [requesterId], references: [id])
+  quote        Quote              @relation(fields: [quoteId], references: [id])
+  steps        ApprovalStep[]
+  auditLog     ApprovalAuditLog[]
+
+  @@index([organizationId])
+}
+
+model ApprovalStep {
+  id                String    @id @default(uuid())
+  purchaseRequestId String
+  routingVersion    Int       // which reconciliation pass produced this row
+  stepOrder         Int
+  stepType          String    // 'sequential' | 'parallel_group'
+  groupId           String?   // shared by all members of one parallel_group
+  approverRole      String
+  approverUserId    String
+  status            String    @default("pending") // pending | approved | rejected | superseded
+  actedById         String?
+  actedAt           DateTime?
+  comments          String?
+  createdAt         DateTime  @default(now())
+
+  purchaseRequest PurchaseRequest @relation(fields: [purchaseRequestId], references: [id])
+  approver        User            @relation("approver", fields: [approverUserId], references: [id])
+
+  @@index([purchaseRequestId, routingVersion])
+  @@index([approverUserId, status])
+}
+
+// ---- Vendor discovery -------------------------------------------------
+
+model Vendor {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  website        String?
+  categories     String[] // tags like "laptops", "industrial-equipment"
+  certifications String[] // e.g. "ISO9001", "SOC2", "WBENC"
+  contactEmail   String?
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  organization     Organization      @relation(fields: [organizationId], references: [id])
+  quotes           Quote[]
+  reliabilityScore ReliabilityScore?
+
+  @@index([organizationId])
+}
+
+// ---- RFQ / quote requests ----------------------------------------------
+
+model RfqEvent {
+  id             String   @id @default(uuid())
+  organizationId String
+  title          String
+  category       String
+  requesterId    String
+  budget         Decimal? @db.Decimal(14, 2)
+  specNotes      String?
+  status         String   @default("open") // open | comparing | awarded | cancelled
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  quotes       Quote[]
+
+  @@index([organizationId])
+}
+
+model Quote {
+  id              String   @id @default(uuid())
+  rfqEventId      String
+  vendorId        String
+  rawDocumentUrl  String?
+  rawEmailText    String?
+  status          String   @default("received") // received | extracting | needs_review | ready | stale
+  totalPrice      Decimal? @db.Decimal(14, 2)
+  currency        String   @default("USD")
+  createdAt       DateTime @default(now())
+
+  rfqEvent         RfqEvent          @relation(fields: [rfqEventId], references: [id])
+  vendor           Vendor            @relation(fields: [vendorId], references: [id])
+  extractedSpecs   ExtractedSpec[]
+  purchaseRequests PurchaseRequest[]
+  negotiations     NegotiationThread[]
+}
+
+model SpecSchema {
+  id        String  @id @default(uuid())
+  category  String
+  fieldKey  String
+  fieldType String  // string | number | boolean | enum
+  unit      String?
+  required  Boolean @default(false)
+
+  @@unique([category, fieldKey])
+}
+
+model ExtractedSpec {
+  id           String    @id @default(uuid())
+  quoteId      String
+  fieldKey     String
+  value        String
+  unit         String?
+  confidence   Float     // 0..1
+  sourceSpan   String?   // the exact source text the value was pulled from
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  quote Quote @relation(fields: [quoteId], references: [id])
+
+  @@index([quoteId])
+}
+
+// ---- Vendor reliability -------------------------------------------------
+
+model ReliabilityScore {
+  id         String   @id @default(uuid())
+  vendorId   String   @unique
+  score      Int      // 0-100
+  rationale  String   // human-readable explanation, generated alongside the score
+  signals    Json     // { onTimeDeliveryRate, financialHealth, certCount, reviewSummary, ... }
+  computedAt DateTime @default(now())
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+}
+
+// ---- Negotiation ---------------------------------------------------------
+
+model NegotiationThread {
+  id               String   @id @default(uuid())
+  quoteId          String
+  status           String   @default("drafting") // drafting | awaiting_approval | sent | vendor_responded | settled
+  targetSavingsPct Float?
+  createdAt        DateTime @default(now())
+
+  quote    Quote                @relation(fields: [quoteId], references: [id])
+  messages NegotiationMessage[]
+}
+
+model NegotiationMessage {
+  id           String    @id @default(uuid())
+  threadId     String
+  direction    String    // outbound_draft | outbound_sent | inbound
+  body         String
+  approvedById String?
+  approvedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  thread NegotiationThread @relation(fields: [threadId], references: [id])
+}
+
+model ApprovalAuditLog {
+  id                String   @id @default(uuid())
+  purchaseRequestId String
+  eventType         String   // routed | rerouted | step_approved | step_rejected | finalization_blocked_reroute | approved | rejected
+  actorId           String?
+  metadata          Json
+  createdAt         DateTime @default(now())
+
+  purchaseRequest PurchaseRequest @relation(fields: [purchaseRequestId], references: [id])
+}
