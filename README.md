@@ -1,11 +1,11 @@
-# Contributing
+# ReadME
 
 This is a reference-implementation AI procurement platform: vendor discovery, RFQs, spec/price
 comparison, vendor reliability, negotiation, configurable multi-step approvals, and purchase
 order generation, built multi-tenant from the ground up. `README.md` covers what's built, what
 needs your own credentials, and how to run it. This doc is about how to safely change it.
 
-Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis) + Claude (Anthropic SDK).
+Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis) 
 Frontend: Next.js (App Router) + React + TypeScript + Tailwind.
 
 ## Quick start
