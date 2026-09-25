@@ -1,232 +1,180 @@
-# AI procurement tool — reference implementation
+# Contributing
 
-Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis).
+This is a reference-implementation AI procurement platform: vendor discovery, RFQs, spec/price
+comparison, vendor reliability, negotiation, configurable multi-step approvals, and purchase
+order generation, built multi-tenant from the ground up. `README.md` covers what's built, what
+needs your own credentials, and how to run it. This doc is about how to safely change it.
+
+Backend: Node.js + Express + Prisma/Postgres + BullMQ (Redis) + Claude (Anthropic SDK).
 Frontend: Next.js (App Router) + React + TypeScript + Tailwind.
 
-## What's real vs. what still needs your own credentials
+## Quick start
 
-Everything below is real, working code — nothing is a placeholder that only pretends to
-function. The distinction that actually matters now is which integrations need *your*
-credentials to do something in the real world versus running self-contained:
+```bash
+git clone <this repo>
+cd backend && npm install && cp ../.env.example .env   # fill in JWT_SECRET, ANTHROPIC_API_KEY
+npx prisma migrate dev
+npx ts-node prisma/seed.ts
+npm run dev        # API on :4000
+npm run workers     # separate terminal — spec extraction + escalation sweeps
 
-- **Approval workflow engine** (`routing-engine.ts`) — policy resolution, versioned
-  reconciliation, in-flight preservation + final-state reconciliation gate, segregation-of-
-  duties, delegation. Fully self-contained, no external service required.
-- **Spec extraction pipeline** (`spec-extraction.ts`, `llm.ts`) — category-aware schema
-  loading, structured LLM extraction with per-field confidence + source span, review queue
-  (`/review`), missing-field follow-up drafting. Needs `ANTHROPIC_API_KEY`.
-- **Price comparison** (`price-comparison.ts`) — normalized matrix builder, TCO calculation.
-  Self-contained.
-- **Vendor reliability scoring** (`reliability.ts`, `/vendors`) — transparent weighted scoring
-  from signals you enter (on-time delivery, financial health, certifications, years in
-  business, defect rate) + an LLM-written rationale. There's no free, credential-less
-  equivalent to a real D&B-style financial-health API, so this takes the signals as input
-  rather than pretending to fetch them from somewhere — wiring a real data source is a matter
-  of populating `financialHealthScore` from that source before calling `scoreVendor`, not
-  redesigning anything here.
-- **Vendor website enrichment** (`vendors.ts`, "enrich from website" on `/vendors`) — a real
-  HTTP fetch of the vendor's site plus an LLM classification call, not a stub. Needs
-  `ANTHROPIC_API_KEY`; no other credential required since it just fetches a public page.
-- **Negotiation** (`negotiation.ts`, `/negotiations/[id]`) — draft generation is separate from
-  sending; exactly one function (`approveAndSendDraft`) can mark a message sent, gated on an
-  authenticated approver. Needs `ANTHROPIC_API_KEY` to draft, SMTP to actually deliver.
-- **Email** (`mailer.ts`) — real SMTP via nodemailer, used for quote requests, negotiation
-  sends, password reset, and email verification. Without `SMTP_HOST`/`SMTP_USER`/`SMTP_PASS`
-  set, it logs the email to the console instead of failing — useful for local dev, not
-  something to leave unset in production.
-- **ERP export** (`po.ts`) — delivers the PO as a signed webhook POST to `ERP_WEBHOOK_URL`
-  (HMAC-signed with `ERP_WEBHOOK_SECRET`, same pattern Stripe/GitHub use for outbound
-  webhooks) rather than one specific ERP's SDK, since which ERP you're integrating with is a
-  decision only you can make. Any real endpoint — a genuine SAP Ariba/Coupa/NetSuite inbound
-  webhook, or middleware like Zapier/Make sitting in front of one — can receive this today.
-  Without a URL configured, it logs instead of failing.
-- **PO generation** (`po.ts`) — gated on `PurchaseRequest.status === "approved"`; won't
-  generate a document otherwise.
-
-Not built, and not planned — **billing**. This product has no seats, subscription state, or
-paywall anywhere, by design.
-
-Genuinely still open:
-- **Vendor discovery beyond a directory** — finding *new* vendors (web search / directory
-  crawl) isn't built; enrichment above only works on a vendor you've already added.
-- Deeper integration/end-to-end tests (see Testing below for what *is* covered) and CI.
-- Input validation is currently whatever Prisma's schema enforces — no dedicated request
-  validation layer (e.g. zod) yet.
-
-## Policy management, negotiation, and spec review
-
-All three now have real UI, not just backend logic:
-
-- **`/policies`** — create/list/retire `ApprovalPolicy` rows: department, category, amount
-  range, priority, and a step-by-step chain builder (sequential or "all required" parallel
-  steps, with an optional condition like `amount > 100000`). Policies are never hard-deleted —
-  "deactivate" sets `activeUntil`, since an in-flight purchase request may have been routed
-  under one and `reconcileRouting()` re-resolves against "currently active" policies on every
-  change.
-- **`/rfqs/[id]`** — add a quote by pasting in vendor-quote text against an existing vendor;
-  this runs the *real* spec-extraction pipeline (queues the same job a real inbound quote
-  would), not a shortcut. From there, **Negotiate** starts a thread at `/negotiations/[id]`:
-  generate an AI-drafted counter-offer, and — the one invariant that matters here — nothing
-  sends until a person clicks "Approve & send"; there's exactly one function
-  (`approveAndSendDraft`) that can mark a message sent. A "simulate vendor reply" box lets you
-  test the loop without real email integration.
-- **`/review`** — every extracted spec field below the confidence threshold, org-wide, each
-  shown next to the exact source text it was pulled from so confirming or correcting it takes
-  seconds rather than re-reading the whole document.
-
-## Multi-tenancy
-
-Every organization is isolated: `Organization` is the tenancy root, and `User`, `Vendor`,
-`RfqEvent`, `ApprovalPolicy`, and `PurchaseRequest` all carry an `organizationId`. Records
-without their own `organizationId` (`Quote`, `ApprovalStep`, `ExtractedSpec`, ...) are scoped
-implicitly through their parent — every route that reaches them checks ownership by walking
-that relation (see `loadOwnedPurchaseRequest`/`loadOwnedRfq`/`quoteBelongsToOrg` etc. in the
-route files) rather than trusting the id alone, since ids are guessable/enumerable.
-
-`organizationId` is embedded in the JWT at issue time (`auth.ts`) and read from
-`req.user.organizationId` everywhere — never from a request body. **Any new list or lookup
-route that skips this filter is a cross-tenant data leak, not just a missing feature.**
-
-**How org membership works:** the first person to sign up for a company creates a new
-`Organization` and becomes its `isOrgOwner`. `createOrganization()` (`org.ts`) also seeds a
-wildcard fallback `ApprovalPolicy` (role `org_owner`) so a brand-new org can route a request
-to its owner even before anyone configures a real policy — see `routing-engine.ts`'s
-`resolveRoleToUser`, which special-cases `org_owner` to look up whoever holds that flag in the
-request's organization. A teammate joins the *same* org instead of creating their own by being
-invited first (`/team` page, `POST /org/invites`, owner-only) — registration checks for a
-pending `OrgInvite` matching the signup email before defaulting to "create a new org".
-
-## Authentication, account security, and rate limiting
-
-Sign-in supports email/password and Google, both converging on the same backend-issued JWT
-so the Express API only ever has to verify one kind of token.
-
-- **Backend** (`auth.ts`, `middleware/requireAuth.ts`, `routes/auth.ts`) — bcrypt password
-  hashing, JWT issuance/verification (carrying `organizationId`), and `/auth/google` which
-  independently verifies the Google ID token server-side (never trusts the frontend's claim
-  about who signed in). Every route except `/auth/*` requires `requireAuth`, and write actions
-  read the actor from `req.user`, not from the request body.
-- **Frontend** (`lib/auth-options.ts`, `app/api/auth/[...nextauth]/route.ts`, `app/signin/`) —
-  NextAuth (Auth.js) with a Google provider and a Credentials provider. The Credentials
-  provider's `authorize()` calls the backend's `/auth/login` directly; the Google provider's
-  `jwt` callback exchanges Google's ID token for a backend JWT via `/auth/google`. Either way,
-  `session.backendToken` ends up holding the same kind of token, and `lib/api.ts` attaches it
-  as `Authorization: Bearer <token>` on every call. `middleware.ts` redirects unauthenticated
-  visitors to `/signin` for the protected routes.
-- **Password reset** — `/forgot-password` → `/auth/forgot-password` issues a single-use,
-  hashed, 1-hour token (`verification.ts`) and emails a link; `/reset-password` consumes it.
-  The forgot-password response is identical whether or not the email has an account, so it
-  can't be used to enumerate registered emails.
-- **Email verification** — registration emails a 7-day verification link automatically;
-  Google sign-in skips this since Google already verified that email. `AppNav` shows a banner
-  with a resend link for any unverified account. Nothing is currently gated on verification
-  status — it's tracked and surfaced, not yet enforced as a hard requirement to use the app.
-- **Rate limiting** (`express-rate-limit`) — a strict limiter (20 req/15 min/IP) on
-  `/auth/login`, `/auth/register`, `/auth/forgot-password`, and `/auth/reset-password`
-  specifically, since those are the endpoints brute-forcing or spam-registering would target;
-  a lighter general ceiling (300 req/min/IP) on everything else in `index.ts`.
-
-Required env vars:
-
-```
-# backend/.env
-JWT_SECRET=...
-GOOGLE_CLIENT_ID=...        # same OAuth client as the frontend
-ANTHROPIC_API_KEY=...
-DATABASE_URL=postgres://...
-REDIS_URL=redis://localhost:6379
-FRONTEND_URL=http://localhost:3000   # used to build reset/verify links in emails
-
-# optional — without these, email is logged to the console instead of sent
-SMTP_HOST=...
-SMTP_PORT=587
-SMTP_USER=...
-SMTP_PASS=...
-MAIL_FROM=no-reply@your-domain.example
-
-# optional — without this, ERP export is logged instead of delivered
-ERP_WEBHOOK_URL=...
-ERP_WEBHOOK_SECRET=...
-
-# frontend/.env.local
-NEXTAUTH_SECRET=...
-NEXTAUTH_URL=http://localhost:3000
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-BACKEND_API_BASE=http://localhost:4000/api        # server-side (NextAuth callbacks)
-NEXT_PUBLIC_API_BASE=http://localhost:4000/api    # client-side (lib/api.ts)
+cd ../frontend && npm install && cp ../.env.example .env.local   # fill in NEXTAUTH_SECRET
+npm run dev          # http://localhost:3000
 ```
 
-Seeded demo org "Acme Demo Co" (see `prisma/seed.ts`) — all users share the password
-`demo-password-123`. `admin@example.com` is the org owner (catch-all approver via the wildcard
-policy); `mo@example.com` / `lee@example.com` / `fran@example.com` / `devi@example.com` /
-`dana@example.com` are the engineering approval chain; `rae@example.com` is the requester.
-A self-registered account creates its own separate organization and won't see any of this —
-that's the multi-tenancy boundary working as intended, not a bug.
+Sign in with any seeded demo account (see `backend/prisma/seed.ts` — password
+`demo-password-123` for all of them), or register your own; a fresh registration creates its
+own organization, isolated from the seeded one. Full env var reference is in the main README.
+
+Or skip all of that and run `docker compose up --build` from the repo root with a filled-in
+`.env` — see the Deployment section of the main README. (Worth knowing: that path hasn't been
+exercised in this project's own dev environment, which had no Docker available — if you hit
+something wrong with the Dockerfiles or compose file, that's the most likely place for it.)
+
+## Before you touch anything: the invariants that must never break
+
+Four rules hold this system together. Nearly every bug that matters here is one of these being
+violated, usually by accident, usually in a new route someone added without realizing it.
+
+### 1. Every list or lookup query must be scoped to the caller's organization
+
+`organizationId` lives in the JWT (`auth.ts` → `req.user.organizationId` via
+`middleware/requireAuth.ts`) and is the entire tenancy boundary. There is no other enforcement
+layer — a query that forgets to filter by it is a cross-tenant data leak, not a missing
+feature.
+
+- **List routes** filter directly: `where: { organizationId: req.user!.organizationId }`.
+- **Single-record routes** (`GET /purchase-requests/:id`, `/rfqs/:id/comparison`, negotiation
+  and PO routes) can't just filter a list — the id itself is guessable/enumerable. Every one of
+  these loads the record and checks ownership *before* doing anything else, returning `404`
+  (never `403`) on a mismatch so a request from another org doesn't even confirm the id exists.
+  See `loadOwnedPurchaseRequest` in `routes/purchaseRequests.ts`, `loadOwnedRfq` in
+  `routes/rfqs.ts`, `quoteBelongsToOrg`/`threadBelongsToOrg` in `routes/negotiationAndPo.ts` —
+  copy this pattern for any new by-id route, including ones with no frontend yet. Routes get
+  added before UI; the ownership check doesn't get to wait.
+- **Records without their own `organizationId`** (`Quote`, `ApprovalStep`, `ExtractedSpec`,
+  `NegotiationThread`) are scoped implicitly by walking to a parent that has one (usually
+  `RfqEvent` or `PurchaseRequest`). If you add a new child record type, decide explicitly
+  whether it needs its own `organizationId` or can be scoped through its parent — don't leave
+  it unscoped by default.
+- Role/user lookups inside the routing engine (`resolveRoleToUser` in `routing-engine.ts`) are
+  scoped by `organizationId` too — resolving a role name to a user without that filter would
+  let one org's policy resolve to another org's employee.
+
+### 2. There is exactly one function that decides "is this request's approval chain satisfied"
+
+`reconcileRouting()` in `routing-engine.ts` is called from two places: whenever a
+routing-relevant field changes (`onPurchaseRequestFieldsChanged`), and as a finalization gate
+immediately before a request would flip to `approved` (`tryFinalize`, called after every step
+approval). This is deliberate: a stale approval must never count as final authorization, even
+if a field changed a split second before the last approver clicked approve. If you need new
+logic that touches "what does this request require" or "is it satisfied," it goes inside or
+alongside this function — never as a second, parallel decision path. Two functions that can
+each say "approved" is how this kind of system quietly breaks.
+
+### 3. AI-generated content drafts; a human sends
+
+Negotiation messages (`negotiation.ts`) and quote request emails (`rfq.ts`) are always created
+in a draft/unsent state first. There is exactly one function that can mark a negotiation
+message sent — `approveAndSendDraft`, which requires an authenticated approver — and no code
+path that skips it. If you add a new AI-generated outbound communication (another follow-up
+type, a different message kind), follow the same shape: generate → store as draft → separate,
+explicit, human-triggered send. Don't wire an LLM call directly to `sendEmail()`.
+
+### 4. Audit-relevant records are append-only
+
+`ApprovalPolicy` rows are never deleted, only retired (`activeUntil` set —
+`POST /policies/:id/deactivate`), because an in-flight purchase request may have been routed
+under one and `reconcileRouting()` re-resolves against "currently active" policies on every
+change. `ApprovalStep` rows are never deleted or mutated once `approved`/`rejected`; a
+re-routed chain creates new rows under a new `routingVersion` rather than editing old ones.
+`Delegation` rows are the one exception — they're safe to hard-delete (`DELETE /delegations/:id`)
+because they only affect chain *resolution* going forward; any step already created under a now-deleted
+delegation already has its resolved `approverUserId` baked in. If you're not sure whether a new
+record type needs this treatment, ask: "would deleting this silently rewrite what actually
+happened?" If yes, soft-delete it.
+
+## Adding a new API route: checklist
+
+1. **Auth is automatic** — every router except `authRouter` is mounted behind `requireAuth` in
+   `index.ts`, so `req.user` is always populated inside route handlers. Don't add your own auth
+   check; do make sure your router is mounted in the `requireAuth` block, not the public one.
+2. **Validate the body.** Add a schema to `schemas.ts` and wrap the handler with
+   `validate(yourSchema)` (`middleware/validate.ts`). Look at an existing route for the pattern
+   — validated `req.body` comes back type-coerced, so handlers shouldn't re-check shape.
+3. **Scope by organization** per the invariant above — either a direct `where` filter, or an
+   ownership-check helper for by-id routes. This is not optional and not something to defer to
+   a follow-up PR.
+4. **Write from `req.user`, never the body**, for anything that attributes an action to a
+   person (`actorId`, `approverId`, etc.). The body is client-controlled; `req.user` isn't.
+5. **If it's pure logic** (no DB/network access, deterministic output from its inputs), put it
+   in `src/pure/` as its own small module and write a test for it — see "Testing" below. If
+   it's not pure but you're extracting shared logic, a regular file under `src/` is fine.
+
+## Frontend conventions
+
+- **`lib/api.ts`** is the only place that calls the backend. Every function takes a
+  `session.backendToken` (from `useSession()`) as its first argument and returns already-typed
+  data — see `lib/types.ts` for the shapes. New backend routes get a matching function here,
+  not an inline `fetch()` in a component (the few `fetch()` calls that still exist inline —
+  e.g. the RFQ creation form — are inconsistencies worth cleaning up if you're touching that
+  file, not a pattern to copy).
+- **`components/AppNav.tsx`** is the persistent nav — add a link here for any new top-level
+  page, and add the route to the `matcher` array in `middleware.ts` or it won't be
+  auth-protected.
+- **Design tokens** live in `tailwind.config.ts` (colors: `ink`, `paper`, `teal`, `amber`,
+  `moss`, `rust`, `slate`, `mist`; fonts: `font-sans` for headings, `font-body` for UI text,
+  `font-mono` reserved for genuinely tabular/data content — amounts, statuses, IDs — not
+  decorative labels). Reuse these rather than introducing new colors or ad hoc styling; the
+  whole app, marketing page included, is meant to read as one system.
+- Pages that need the session use `useSession()` from `next-auth/react` and read
+  `session?.backendToken`; there's no server-side session helper in use here, everything is
+  client-rendered (`"use client"`) by convention in this codebase.
 
 ## Testing
 
 ```bash
-cd backend
-npm test
+cd backend && npm test
 ```
 
-20 unit tests across the logic that's genuinely worth testing in isolation: the approval
-chain's condition parser (`amount > 100000` etc.), the reliability-scoring formula, the
-total-cost-of-ownership calculation, and password hashing/JWT issue-verify round trips. These
-were deliberately extracted into `src/pure/*` — small, dependency-free modules — specifically
-so they're testable without a live Postgres/Redis connection; the route and routing-engine
-logic that talks to the database is exercised by using the app itself (see the demo accounts
-above), not by an automated integration suite yet.
+The test suite (`src/pure/*.test.ts`, `src/__tests__/*.test.ts`) covers pure business logic and
+security-critical middleware in isolation — the approval chain's condition parser, the
+reliability-scoring formula, TCO calculation, password hashing/JWT round-trips, and the
+`requireAuth`/`validate` middleware — deliberately without a live database, so they run
+anywhere instantly. There's no integration/e2e suite yet (nothing exercises routes + a real
+Postgres together); if you add one, a real Postgres in CI (not mocking Prisma) is the more
+valuable direction than deeper mocking.
 
-## Deployment
+When you add a pure function, add its test alongside it in `src/pure/`. When you touch
+`routing-engine.ts`, at minimum extend the `chain-conditions` tests if you touched condition
+parsing — the reconciliation logic itself still isn't unit-tested (see below), so tests on the
+piece that is are worth keeping thorough.
 
-`docker-compose.yml` at the repo root wires up Postgres, Redis, the API, the BullMQ worker
-process, and the frontend, each from its own `Dockerfile`. Copy `.env.example` to `.env`, fill
-in at least `JWT_SECRET`, `NEXTAUTH_SECRET`, and `ANTHROPIC_API_KEY`, then:
+CI (`.github/workflows/ci.yml`) runs `tsc --noEmit` + `npm test` for the backend and
+`next build` for the frontend on every push/PR. It runs `prisma generate` first, which needs
+real network access to Prisma's engine registry — this project's own dev sandbox couldn't
+reach it, which is why backend commands here are sometimes run with Prisma-generation errors
+filtered out; a real CI runner won't have that problem.
 
-```bash
-docker compose up --build
-```
+## Where to start
 
-The frontend's `NEXT_PUBLIC_API_BASE` is baked in at build time (it's a browser-side env var,
-not a runtime one — a Next.js/Docker gotcha worth knowing about), so if you're deploying
-behind a real domain rather than localhost, set it in `.env` before building, not after.
+Genuinely open work, roughly in order of impact:
 
-The backend Dockerfile runs `prisma generate` during the image build; the compose file runs
-`prisma migrate deploy` + the seed script once via a one-shot `migrate` service before the API
-and worker start.
+- **Integration tests for `routing-engine.ts` against a real Postgres** — the most
+  consequential untested code in the repo. The unit tests cover its pure helpers; the
+  stateful reconciliation logic (in-flight preservation, the finalization gate, segregation of
+  duties) only gets exercised by using the app.
+- **A real vendor financial-health data source** — `scoreVendor` takes `financialHealthScore`
+  as a plain input; wiring a real API (D&B-style) means populating that field before the call,
+  not redesigning `reliability.ts`.
+- **Policy conflict handling** — if two policies of equal priority match the same request, the
+  current behavior is whichever `findMatchingPolicy` finds first; explicit tie-breaking would
+  be a good, self-contained improvement.
+- **An actual verified Docker build** — see the caveat above.
+- Accessibility and mobile-responsiveness pass — functional but not deeply audited.
+- Anything in the main README's "Genuinely still open" list.
 
-## Running it locally without Docker
-
-```bash
-# Backend
-cd backend
-npm install
-npm run prisma:migrate
-npx ts-node prisma/seed.ts
-npm run dev       # API on :4000
-npm run workers   # separate process — spec-extraction + escalation sweeps
-
-# Frontend
-cd frontend
-npm install
-npm run dev        # http://localhost:3000
-```
-
-Pages: `/` (marketing landing), `/signin` (sign-in/register), `/forgot-password` +
-`/reset-password` + `/verify-email`, `/approvals` (queue + detail), `/requests` (your
-submitted requests), `/requests/new` (quick-create for testing the approval flow), `/rfqs` +
-`/rfqs/[id]` (list, detail, add quote), `/rfqs/[id]/compare` (comparison matrix),
-`/negotiations/[id]` (draft/approve/send), `/review` (spec review queue), `/policies`
-(approval chain configuration), `/vendors` (directory, reliability scoring, website
-enrichment), `/team` (org members + invites).
-
-## The one invariant worth re-reading before extending any of this
-
-`reconcileRouting()` in `routing-engine.ts` is called both on every routing-relevant field
-change and as the finalization gate right before a request would flip to `approved`. If you
-add a new feature that mutates a `PurchaseRequest`'s amount/department/category outside of
-`onPurchaseRequestFieldsChanged` (e.g. a bulk-import script), route it through that function
-too — that's the only way the "never let a stale approval count as final authorization"
-guarantee holds.
+If you're adding a feature not listed here, the four invariants above are the review bar —
+a PR that adds a new by-id route without an ownership check, or a new AI-drafted message that
+sends without an explicit approval step, is the kind of thing that should get caught in review
+even if the feature itself works.
